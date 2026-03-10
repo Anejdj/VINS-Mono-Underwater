@@ -1,4 +1,6 @@
 #include "feature_tracker.h"
+#include <fstream>
+
 
 int FeatureTracker::n_id = 0;
 
@@ -86,13 +88,109 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
 
     if (EQUALIZE)
     {
-        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
         TicToc t_c;
-        clahe->apply(_img, img);
-        ROS_DEBUG("CLAHE costs: %fms", t_c.toc());
+    
+        static bool init_done = false;
+        static int frame_cnt = 0;
+        static const int INIT_N = 500;
+        static long sum_F = 0;
+        static double avg_F = 600;  
+        static double last_best_clip = 3.0;
+        static int last_numF = -1;
+        static cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
+    
+        if (!init_done)
+        {
+            frame_cnt++;
+        
+            clahe->setClipLimit(3.0);
+            clahe->apply(_img, img);
+        
+            vector<cv::KeyPoint> kps;
+            cv::FAST(img, kps, 20, true);
+            int numF = kps.size();
+            sum_F += numF;
+        
+            
+        
+            if (frame_cnt >= INIT_N)
+            {
+                avg_F = sum_F * 1.0 / INIT_N;
+                init_done = true;
+            
+                
+            }
+        }
+        else
+        {
+            const int TARGET = (int)avg_F;
+            const int MIN_F = avg_F * 0.5;
+            const int MAX_F = avg_F * 1.5;
+        
+            bool need_search = true;
+            if (last_numF >= MIN_F && last_numF <= MAX_F)
+                need_search = false;
+        
+            if (!need_search)
+            {
+                clahe->setClipLimit(last_best_clip);
+                clahe->apply(_img, img);
+            
+                vector<cv::KeyPoint> kps;
+                cv::FAST(img, kps, 20, true);
+                last_numF = kps.size();
+            
+                
+            }
+            else
+            {
+                double low  = max(0.0, last_best_clip - 1.0);
+                double high = min(6.0, last_best_clip + 1.0);
+                double best_clip = last_best_clip;
+                int best_diff = INT_MAX;
+                cv::Mat best_img;
+            
+                for (int i = 0; i < 10; i++)
+                {
+                    double mid = 0.5 * (low + high);
+                    clahe->setClipLimit(mid);
+                    cv::Mat t;
+                    clahe->apply(_img, t);
+                
+                    vector<cv::KeyPoint> kps;
+                    cv::FAST(t, kps, 20, true);
+                    int numF = kps.size();
+                
+                    int diff = abs(numF - TARGET);
+                    if (diff < best_diff)
+                    {
+                        best_diff = diff;
+                        best_clip = mid;
+                        t.copyTo(best_img);
+                    }
+                
+                    if (numF < TARGET) low = mid;
+                    else high = mid;
+                
+                    if (abs(high - low) < 1e-3) break;
+                }
+            
+                img = best_img;
+                last_best_clip = best_clip;
+                last_numF = TARGET - best_diff;
+            
+                
+            }
+        }
     }
     else
+    {
         img = _img;
+    }
+
+
+    
+
 
     if (forw_img.empty())
     {
@@ -115,6 +213,33 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
         for (int i = 0; i < int(forw_pts.size()); i++)
             if (status[i] && !inBorder(forw_pts[i]))
                 status[i] = 0;
+
+
+
+        // ====== 双向光流验证 ======
+        vector<cv::Point2f> back_pts;
+        vector<uchar> reverse_status;
+        vector<float> reverse_err;
+        
+        // 反向光流：从当前帧到前一帧
+        cv::calcOpticalFlowPyrLK(forw_img, cur_img, forw_pts, back_pts, 
+                                reverse_status, reverse_err, cv::Size(21, 21), 3);
+
+        const double BIDIRECTIONAL_THRESH = 20.0;  // 双向一致性阈值
+        
+        for (int i = 0; i < static_cast<int>(forw_pts.size()); i++) {
+            if (status[i] && reverse_status[i]) {
+                double back_forth_error = cv::norm(cur_pts[i] - back_pts[i]);
+                if (back_forth_error > BIDIRECTIONAL_THRESH) {
+                    status[i] = 0;
+                }
+            } else {
+                status[i] = 0;
+            }
+        }
+
+
+
         reduceVector(prev_pts, status);
         reduceVector(cur_pts, status);
         reduceVector(forw_pts, status);
@@ -146,10 +271,43 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
                 cout << "mask type wrong " << endl;
             if (mask.size() != forw_img.size())
                 cout << "wrong size " << endl;
-            cv::goodFeaturesToTrack(forw_img, n_pts, MAX_CNT - forw_pts.size(), 0.01, MIN_DIST, mask);
+
+
+
+
+
+
+
+                
+            // 使用ORB特征检测器
+            cv::Ptr<cv::ORB> orb_detector = cv::ORB::create(
+                n_max_cnt,                    // 需要检测的特征点数量
+                1.2f,                         // 尺度因子
+                8,                            // 尺度层数
+                MIN_DIST,                     // 边缘阈值
+                0,                            // 起始层
+                2,                            // WTA_K
+                cv::ORB::HARRIS_SCORE,        // 评分类型
+                31,                           // patch大小
+                20                            // FAST阈值
+            );
+
+            // 使用mask检测新的关键点
+            vector<cv::KeyPoint> new_keypoints;
+            orb_detector->detect(forw_img, new_keypoints, mask);
+
+            // 转换KeyPoint到Point2f格式
+            n_pts.clear();
+            n_pts.reserve(new_keypoints.size());
+            for (const auto &keypoint : new_keypoints) {
+                n_pts.push_back(keypoint.pt);
+            }
         }
         else
+        {
             n_pts.clear();
+        }
+        
         ROS_DEBUG("detect feature costs: %fms", t_t.toc());
 
         ROS_DEBUG("add feature begins");
@@ -157,6 +315,16 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
         addPoints();
         ROS_DEBUG("selectFeature costs: %fms", t_a.toc());
     }
+
+
+
+
+
+
+
+
+
+
     prev_img = cur_img;
     prev_pts = cur_pts;
     prev_un_pts = cur_un_pts;
