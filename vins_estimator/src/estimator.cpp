@@ -79,6 +79,7 @@ void Estimator::clearState()
 
     drift_correct_r = Matrix3d::Identity();
     drift_correct_t = Vector3d::Zero();
+    
 }
 
 void Estimator::processIMU(double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity)
@@ -188,7 +189,9 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     {
         TicToc t_solve;
         solveOdometry();
-        ROS_DEBUG("solver costs: %fms", t_solve.toc());
+        
+        ROS_INFO("[TIME] solver costs: %.2fms | parallax: %.2fpx",
+          t_solve.toc(), f_manager.last_avg_parallax);
 
         if (failureDetection())
         {
@@ -203,7 +206,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
         TicToc t_margin;
         slideWindow();
         f_manager.removeFailures();
-        ROS_DEBUG("marginalization costs: %fms", t_margin.toc());
+        ROS_INFO("[TIME] marginalization costs: %.2fms", t_margin.toc());
         // prepare output of VINS
         key_poses.clear();
         for (int i = 0; i <= WINDOW_SIZE; i++)
@@ -470,18 +473,19 @@ bool Estimator::relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l)
     return false;
 }
 
+
+
 void Estimator::solveOdometry()
 {
     if (frame_count < WINDOW_SIZE)
         return;
     if (solver_flag == NON_LINEAR)
     {
-        TicToc t_tri;
         f_manager.triangulate(Ps, tic, ric);
-        ROS_DEBUG("triangulation costs %f", t_tri.toc());
         optimization();
     }
 }
+
 
 void Estimator::vector2double()
 {
@@ -805,14 +809,30 @@ void Estimator::optimization()
     options.linear_solver_type = ceres::DENSE_SCHUR;
     //options.num_threads = 2;
     options.trust_region_strategy_type = ceres::DOGLEG;
-    options.max_num_iterations = NUM_ITERATIONS;
+
+
+
+    // 方案C：基于运动激励的自适应求解时间
+    double adaptive_time;
+    if (f_manager.last_avg_parallax > 10.0)
+        adaptive_time = SOLVER_TIME;           // 剧烈运动，给满
+    else if (f_manager.last_avg_parallax > 5.0)
+        adaptive_time = SOLVER_TIME * 0.6;     // 中等运动，给60%
+    else
+        adaptive_time = SOLVER_TIME * 0.3;     // 平稳，给30%
+    options.max_num_iterations = NUM_ITERATIONS;  // 迭代次数恢复固定
+
     //options.use_explicit_schur_complement = true;
     //options.minimizer_progress_to_stdout = true;
     //options.use_nonmonotonic_steps = true;
+
     if (marginalization_flag == MARGIN_OLD)
-        options.max_solver_time_in_seconds = SOLVER_TIME * 4.0 / 5.0;
+        options.max_solver_time_in_seconds = adaptive_time * 4.0 / 5.0;
     else
-        options.max_solver_time_in_seconds = SOLVER_TIME;
+        options.max_solver_time_in_seconds = adaptive_time;    
+
+
+
     TicToc t_solver;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -870,6 +890,8 @@ void Estimator::optimization()
                 int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
                 if (imu_i != 0)
                     continue;
+
+                
 
                 Vector3d pts_i = it_per_id.feature_per_frame[0].point;
 
