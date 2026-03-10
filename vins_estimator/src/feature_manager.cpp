@@ -23,6 +23,7 @@ void FeatureManager::setRic(Matrix3d _ric[])
 void FeatureManager::clearState()
 {
     feature.clear();
+    last_avg_parallax = 0.0;  // 新增：无视差时置零，表示悬停状态
 }
 
 int FeatureManager::getFeatureCount()
@@ -86,12 +87,14 @@ bool FeatureManager::addFeatureCheckParallax(int frame_count, const map<int, vec
 
     if (parallax_num == 0)
     {
+        last_avg_parallax = 0.0;  // 新增：无视差时置零，表示悬停状态
         return true;
     }
     else
     {
         ROS_DEBUG("parallax_sum: %lf, parallax_num: %d", parallax_sum, parallax_num);
         ROS_DEBUG("current parallax: %lf", parallax_sum / parallax_num * FOCAL_LENGTH);
+        last_avg_parallax = parallax_sum / parallax_num * FOCAL_LENGTH;  // 新增：保存均值
         return parallax_sum / parallax_num >= MIN_PARALLAX;
     }
 }
