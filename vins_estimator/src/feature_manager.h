@@ -92,6 +92,7 @@ class FeatureManager
     void removeOutlier();
     list<FeaturePerId> feature;
     int last_track_num;
+    double last_avg_parallax;  // 新增：存储平均视差（像素），供后端触发判断
 
   private:
     double compensatedParallax2(const FeaturePerId &it_per_id, int frame_count);
