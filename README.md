@@ -1,3 +1,124 @@
+# VINS-Mono-Underwater
+
+> 🇨🇳 [中文说明见下方](#中文说明) ｜ 🇬🇧 English version below
+
+针对水下机器人导航场景对 [VINS-Mono](https://github.com/HKUST-Aerial-Robotics/VINS-Mono) 进行源码级改进，解决水下图像退化与计算资源浪费问题。在 [MCUVI 数据集](https://github.com/ntnu-arl/underwater-datasets/tree/main?tab=readme-ov-file#subset-1-motion-patterns)上验证，序列3原版轨迹发散，改进后恢复稳定定位。
+
+---
+
+## 中文说明
+
+### 问题背景
+
+VINS-Mono 面向陆地/空中场景设计，直接用于水下时存在两个核心问题：
+
+- **前端不稳定**：水下低对比度、非均匀光照、悬浮颗粒干扰导致特征提取失败。固定 CLAHE 参数无法适应动态变化的水下光照。
+- **后端算力浪费**：固定 40ms 求解时间预算，在机器人悬停/低速平移等低动态状态下，优化器早已收敛，剩余时间形成无效等待。
+
+### 改进方案
+
+**前端（`feature_tracker.cpp`）**
+
+1. **自适应 CLAHE**：以前 500 帧的平均特征点数量为基准，通过二分搜索动态调节限幅因子，将特征点数量稳定在目标范围内。
+2. **ORB 特征检测**（替换 Shi-Tomasi）：在低纹理水下场景中具备更好的重复性。
+3. **双向光流一致性校验**：正向追踪后执行反向验证，剔除往返误差超过 20px 的外点。
+
+**后端（`estimator.cpp` + `feature_manager.cpp`）**
+
+以前端输出的平均视差作为运动激励代理指标，三档自适应分配求解时间：
+
+| 平均视差 | 求解时间预算 |
+|:---:|:---:|
+| > 10px | T₀（满额 40ms）|
+| 5~10px | 0.6 × T₀ |
+| ≤ 5px | 0.3 × T₀ |
+
+### 实验结果（MCUVI 数据集）
+
+**定位精度（ATE RMSE）**
+
+| 序列 | 原版 VINS-Mono | 本改进版 | 变化 |
+|:---:|:---:|:---:|:---:|
+| 序列 1 | 1.57 m | 1.38 m | **−11.9%** |
+| 序列 2 | 4.78 m（不稳定）| 2.58 m | **稳定** |
+| 序列 3 | 轨迹发散 | 1.65 m | **恢复定位** |
+| 序列 4 | 2.04 m | 2.17 m | 在噪声范围内 |
+| 序列 5/6 | 均发散 | 均发散 | — |
+
+**后端计算效率**
+
+| 序列 | 求解耗时降幅 |
+|:---:|:---:|
+| 序列 1 | −13.8% |
+| 序列 4 | −14.3% |
+
+前端版与完整版之间的 RMSE 差异均 < 0.1m（在测量噪声范围内），证明效率提升不以精度为代价。
+
+### 修改文件
+
+| 文件 | 改动内容 |
+|---|---|
+| `feature_tracker/src/feature_tracker.cpp` | 自适应 CLAHE + ORB 检测 + 双向光流校验 |
+| `vins_estimator/src/feature_manager.cpp` | 逐帧计算并暴露 `last_avg_parallax` |
+| `vins_estimator/include/vins_estimator/feature_manager.h` | 新增 `last_avg_parallax` 字段 |
+| `vins_estimator/src/estimator.cpp` | 读取视差 → 设置自适应 `max_solver_time` |
+
+### 实地部署平台
+
+- 树莓派 4B（板载计算）
+- WHEELTEC N100 九轴 IMU（陀螺零偏不稳定性 5°/h）
+- 树莓派摄像头 V1（OV5647，~17Hz 采集，15Hz 处理）
+- 1 × 1500 流明水下补光灯
+- 4×4m 室内水池，水深 1m
+- ArUco 标识码阵列（3×3，200mm，4×4 字典）作为外部定位基准
+
+---
+
+## English
+
+### Problem
+
+VINS-Mono degrades underwater due to:
+- **Frontend instability**: Low contrast, backscatter, and non-uniform illumination break feature extraction. Fixed CLAHE parameters cannot adapt.
+- **Backend inefficiency**: Fixed 40ms solver budget wastes compute during low-motion phases (hovering, slow translation).
+
+### Improvements
+
+**Frontend (`feature_tracker.cpp`)**
+1. Adaptive CLAHE with feature-count feedback (binary search, 10 iterations)
+2. ORB feature detection replacing Shi-Tomasi
+3. Bidirectional optical flow consistency check (threshold: 20px)
+
+**Backend (`estimator.cpp`, `feature_manager.cpp`)**
+
+Three-tier adaptive solver time based on average parallax:
+
+| Parallax | Budget |
+|:---:|:---:|
+| > 10px | T₀ (40ms) |
+| 5–10px | 0.6 × T₀ |
+| ≤ 5px | 0.3 × T₀ |
+
+### Results (MCUVI Dataset)
+
+| Sequence | Original | Ours | Δ |
+|:---:|:---:|:---:|:---:|
+| Seq 1 | 1.57 m | 1.38 m | **−11.9%** |
+| Seq 2 | 4.78 m (unstable) | 2.58 m | **stable** |
+| Seq 3 | diverged | 1.65 m | **recovered** |
+| Seq 4 | 2.04 m | 2.17 m | within noise |
+
+Backend solver time reduced by up to 14.3%. Accuracy loss vs. frontend-only: < 0.1m.
+
+### Environment
+- ROS 1 (Kinetic/Melodic), Ubuntu 16.04
+- OpenCV 3.x, Ceres Solver, Eigen3
+
+### License
+GPL-3.0, consistent with original VINS-Mono.
+Original: Qin et al., "VINS-Mono", IEEE T-RO 2018.
+
+
 # VINS-Mono
 ## A Robust and Versatile Monocular Visual-Inertial State Estimator
 
